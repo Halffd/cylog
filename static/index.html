@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cytube Chat Viewer</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    {{if .InjectTampermonkeyBridge}}
+    <script src="/scripts/cylog-tampermonkey-bridge.js"></script>
+    {{end}}
+</head>
+<body>
+    <div class="app-container">
+        <header>
+            <h1>Cytube Chat Viewer</h1>
+            <div class="controls">
+                <a href="/logs" class="nav-link">View Logs</a>
+                <button id="fontSizeIncrease">A+</button>
+                <button id="fontSizeDecrease">A-</button>
+                <button id="chatWidthIncrease">W+</button>
+                <button id="chatWidthDecrease">W-</button>
+            </div>
+        </header>
+        <main>
+            <div id="chatwrap">
+                <div id="messagebuffer"></div>
+            </div>
+        </main>
+    </div>
+    <script>
+        const wsUrl = "ws://{{.Host}}/ws";
+    </script>
+    <script src="/static/app.js"></script>
+</body>
+</html>

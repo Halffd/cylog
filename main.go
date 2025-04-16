@@ -2,31 +2,36 @@ package main
 
 import (
 	"context"
-	"embed"
-	"encoding/json"
 	"fmt"
-	"html/template"
-	"io/fs"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
-	"github.com/webview/webview"
-	"github.com/zserge/lorca"
 )
 
 // Constants
 const (
-	appPort      = 8080
-	appWidth     = 1000
-	appHeight    = 700
-	webSocketURL = "wss://cytube.net/ws" // Update with actual WebSocket URL
+	appPort         = 8080
+	appWidth        = 1000
+	appHeight       = 700
+	webSocketURL    = "wss://cytube.net/ws" // Update with actual WebSocket URL
+	logsDir         = "logs"
+	maxLogFileSize  = 10 * 1024 * 1024 // 10 MB
+	maxLogFiles     = 5
+	logDateFormat   = "2006-01-02"
+	desktopAppTitle = "Cytube Chat Viewer"
 )
 
 // Message represents a chat message
@@ -36,6 +41,169 @@ type Message struct {
 	Timestamp time.Time `json:"timestamp"`
 	Content   string    `json:"content"`
 	HTML      string    `json:"html"`
+}
+
+// Logger handles logging to files
+type Logger struct {
+	currentLogFile *os.File
+	logMutex       sync.Mutex
+	logFilePath    string
+}
+
+// NewLogger creates a new logger instance
+func NewLogger() (*Logger, error) {
+	// Create logs directory if it doesn't exist
+	if err := os.MkdirAll(logsDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create logs directory: %w", err)
+	}
+
+	logger := &Logger{}
+	if err := logger.rotateLogFile(); err != nil {
+		return nil, err
+	}
+
+	return logger, nil
+}
+
+// rotateLogFile creates a new log file with the current date
+func (l *Logger) rotateLogFile() error {
+	l.logMutex.Lock()
+	defer l.logMutex.Unlock()
+
+	// Close the current log file if it's open
+	if l.currentLogFile != nil {
+		l.currentLogFile.Close()
+	}
+
+	// Create a new log file with the current date
+	currentDate := time.Now().Format(logDateFormat)
+	logFileName := fmt.Sprintf("chat-%s.log", currentDate)
+	l.logFilePath = filepath.Join(logsDir, logFileName)
+
+	file, err := os.OpenFile(l.logFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open log file: %w", err)
+	}
+
+	l.currentLogFile = file
+
+	// Clean old log files
+	go l.cleanOldLogFiles()
+
+	return nil
+}
+
+// cleanOldLogFiles removes old log files if there are more than maxLogFiles
+func (l *Logger) cleanOldLogFiles() {
+	files, err := filepath.Glob(filepath.Join(logsDir, "chat-*.log"))
+	if err != nil {
+		log.Printf("Error finding log files: %v", err)
+		return
+	}
+
+	if len(files) <= maxLogFiles {
+		return
+	}
+
+	// Sort files by modification time (oldest first)
+	fileInfos := make(map[string]os.FileInfo, len(files))
+	for _, file := range files {
+		info, err := os.Stat(file)
+		if err != nil {
+			log.Printf("Error getting file info for %s: %v", file, err)
+			continue
+		}
+		fileInfos[file] = info
+	}
+
+	// Sort files by modification time
+	filesToDelete := len(files) - maxLogFiles
+	for i := 0; i < filesToDelete; i++ {
+		var oldestFile string
+		var oldestTime time.Time
+		first := true
+
+		for file, info := range fileInfos {
+			if first || info.ModTime().Before(oldestTime) {
+				oldestFile = file
+				oldestTime = info.ModTime()
+				first = false
+			}
+		}
+
+		if oldestFile != "" {
+			os.Remove(oldestFile)
+			delete(fileInfos, oldestFile)
+			log.Printf("Deleted old log file: %s", oldestFile)
+		}
+	}
+}
+
+// LogMessage logs a message to the current log file
+func (l *Logger) LogMessage(msg Message) error {
+	l.logMutex.Lock()
+	defer l.logMutex.Unlock()
+
+	// Check if we need to rotate the log file based on size
+	info, err := os.Stat(l.logFilePath)
+	if err == nil && info.Size() > maxLogFileSize {
+		if err := l.rotateLogFile(); err != nil {
+			return err
+		}
+	}
+
+	// Check if we need to rotate based on date
+	currentDate := time.Now().Format(logDateFormat)
+	if !strings.Contains(l.logFilePath, currentDate) {
+		if err := l.rotateLogFile(); err != nil {
+			return err
+		}
+	}
+
+	// Format and write the log entry
+	timestamp := msg.Timestamp.Format("2006-01-02 15:04:05")
+	logEntry := fmt.Sprintf("[%s] %s: %s\n", timestamp, msg.Username, msg.Content)
+
+	if _, err := l.currentLogFile.WriteString(logEntry); err != nil {
+		return fmt.Errorf("failed to write to log file: %w", err)
+	}
+
+	return nil
+}
+
+// GetAvailableLogs returns a list of available log files
+func (l *Logger) GetAvailableLogs() ([]string, error) {
+	files, err := filepath.Glob(filepath.Join(logsDir, "chat-*.log"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to find log files: %w", err)
+	}
+
+	// Extract just the filenames without the path
+	logFiles := make([]string, len(files))
+	for i, file := range files {
+		logFiles[i] = filepath.Base(file)
+	}
+
+	return logFiles, nil
+}
+
+// GetLogContent returns the content of a specified log file
+func (l *Logger) GetLogContent(filename string) (string, error) {
+	// Validate the filename to ensure it's a log file
+	if !strings.HasPrefix(filename, "chat-") || !strings.HasSuffix(filename, ".log") {
+		return "", fmt.Errorf("invalid log filename")
+	}
+
+	// Construct the full path with directory
+	filePath := filepath.Join(logsDir, filename)
+
+	// Read the file content
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read log file: %w", err)
+	}
+
+	return string(content), nil
 }
 
 // ChatServer manages chat state and connections
@@ -48,19 +216,18 @@ type ChatServer struct {
 	cytubeConn  *websocket.Conn
 	messagesMux sync.RWMutex
 	upgrader    websocket.Upgrader
+	logger      *Logger
 }
 
-//go:embed static
-var staticFiles embed.FS
-
 // NewChatServer creates a new chat server
-func NewChatServer() *ChatServer {
+func NewChatServer(logger *Logger) *ChatServer {
 	return &ChatServer{
 		clients:    make(map[*websocket.Conn]bool),
 		messages:   make([]Message, 0, 100),
 		broadcast:  make(chan Message),
 		register:   make(chan *websocket.Conn),
 		unregister: make(chan *websocket.Conn),
+		logger:     logger,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -124,6 +291,11 @@ func (s *ChatServer) readCytubeMessages() {
 			HTML:      string(data), // Assuming HTML content is provided
 		}
 
+		// Log the message to file
+		if err := s.logger.LogMessage(msg); err != nil {
+			log.Printf("Error logging message: %v", err)
+		}
+
 		s.broadcast <- msg
 	}
 }
@@ -180,8 +352,8 @@ func (s *ChatServer) sendRecentMessages(client *websocket.Conn) {
 }
 
 // handleWebSocket handles WebSocket connections from clients
-func (s *ChatServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := s.upgrader.Upgrade(w, r, nil)
+func (s *ChatServer) handleWebSocket(c *gin.Context) {
+	conn, err := s.upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		log.Printf("Error upgrading to WebSocket: %v", err)
 		return
@@ -195,7 +367,6 @@ func (s *ChatServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			s.unregister <- conn
 		}()
-
 		for {
 			var msg Message
 			err := conn.ReadJSON(&msg)
@@ -206,6 +377,11 @@ func (s *ChatServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 
+			// Log the message to file
+			if err := s.logger.LogMessage(msg); err != nil {
+				log.Printf("Error logging message: %v", err)
+			}
+
 			// Process the message if needed
 			// For now, we just echo it back
 			s.broadcast <- msg
@@ -213,420 +389,258 @@ func (s *ChatServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
-// setupHTTPServer sets up the HTTP server for web UI
-func setupHTTPServer(ctx context.Context, chatServer *ChatServer) *http.Server {
-	mux := http.NewServeMux()
+// setupGinServer sets up the Gin server for web UI and API
+func setupGinServer(ctx context.Context, chatServer *ChatServer) *gin.Engine {
+	// Set Gin to release mode in production
+	gin.SetMode(gin.ReleaseMode)
+
+	// Create gin router
+	router := gin.Default()
+
+	// Load HTML templates
+	router.LoadHTMLGlob("static/*.html")
 
 	// Serve static files
-	staticContent, err := fs.Sub(staticFiles, "static")
-	if err != nil {
-		log.Fatalf("Failed to load static files: %v", err)
+	router.Static("/static", "./static")
+
+	// Serve scripts directory
+	router.Static("/scripts", "./scripts")
+
+	// API group for v1
+	api := router.Group("/api/v1")
+	{
+		// Messages endpoints
+		api.GET("/messages", func(c *gin.Context) {
+			chatServer.messagesMux.RLock()
+			defer chatServer.messagesMux.RUnlock()
+
+			c.JSON(http.StatusOK, chatServer.messages)
+		})
+
+		// Logs endpoints
+		api.GET("/logs", func(c *gin.Context) {
+			logs, err := chatServer.logger.GetAvailableLogs()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			c.JSON(http.StatusOK, logs)
+		})
+
+		api.GET("/logs/:filename", func(c *gin.Context) {
+			filename := c.Param("filename")
+			content, err := chatServer.logger.GetLogContent(filename)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			// Check if format=json is requested
+			if c.Query("format") == "json" {
+				// Parse log content into JSON array
+				lines := strings.Split(content, "\n")
+				logs := make([]map[string]string, 0)
+
+				for _, line := range lines {
+					if line == "" {
+						continue
+					}
+
+					// Parse line like: [2025-04-16 15:04:05] Username: Message content
+					re := regexp.MustCompile(`\[(.*?)\] (.*?): (.*)`)
+					matches := re.FindStringSubmatch(line)
+
+					if len(matches) == 4 {
+						logs = append(logs, map[string]string{
+							"timestamp": matches[1],
+							"username":  matches[2],
+							"content":   matches[3],
+						})
+					}
+				}
+
+				c.JSON(http.StatusOK, logs)
+			} else {
+				// Return as plain text
+				c.String(http.StatusOK, content)
+			}
+		})
 	}
-	fileServer := http.FileServer(http.FS(staticContent))
-	mux.Handle("/static/", http.StripPrefix("/static/", fileServer))
+
+	// Tampermonkey compatibility endpoints
+	api.GET("/tampermonkey/bridge.user.js", func(c *gin.Context) {
+		// Serve the Tampermonkey bridge script with the correct content type
+		c.File("scripts/cylog-tampermonkey-bridge.js")
+	})
+
+	// Backwards compatibility for old API
+	router.GET("/api/messages", func(c *gin.Context) {
+		chatServer.messagesMux.RLock()
+		defer chatServer.messagesMux.RUnlock()
+
+		c.JSON(http.StatusOK, chatServer.messages)
+	})
 
 	// Serve index page
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-
-		tmpl, err := template.ParseFS(staticFiles, "static/index.html")
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "text/html")
-		tmpl.Execute(w, map[string]interface{}{
-			"WebSocketURL": fmt.Sprintf("ws://%s/ws", r.Host),
+	router.GET("/", func(c *gin.Context) {
+		host := c.Request.Host
+		c.HTML(http.StatusOK, "index.html", gin.H{
+			"Host":                     host,
+			"InjectTampermonkeyBridge": true,
 		})
 	})
 
 	// WebSocket endpoint
-	mux.HandleFunc("/ws", chatServer.handleWebSocket)
+	router.GET("/ws", chatServer.handleWebSocket)
 
-	// API endpoints
-	mux.HandleFunc("/api/messages", func(w http.ResponseWriter, r *http.Request) {
-		chatServer.messagesMux.RLock()
-		defer chatServer.messagesMux.RUnlock()
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(chatServer.messages)
+	// Add a logs page
+	router.GET("/logs", func(c *gin.Context) {
+		logs, err := chatServer.logger.GetAvailableLogs()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.HTML(http.StatusOK, "logs.html", gin.H{
+			"Logs": logs,
+		})
 	})
 
-	// Create HTTP server
-	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", appPort),
-		Handler: mux,
+	return router
+}
+
+// openBrowser opens the URL in the default browser
+func openBrowser(url string) error {
+	var cmd string
+	var args []string
+
+	// Detect the OS and set the appropriate command
+	switch runtime.GOOS {
+	case "windows":
+		cmd = "cmd"
+		args = []string{"/c", "start", url}
+	case "darwin":
+		cmd = "open"
+		args = []string{url}
+	default: // "linux", "freebsd", "openbsd", "netbsd"
+		cmd = "xdg-open"
+		args = []string{url}
 	}
 
-	// Start the HTTP server in a goroutine
-	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server error: %v", err)
+	return exec.Command(cmd, args...).Start()
+}
+
+// launchDesktopApp launches the desktop application using either webview or the system browser
+func launchDesktopApp(url string) {
+	// First try to use webview
+	if webviewAvailable() {
+		go func() {
+			// Wait a moment for the server to start
+			time.Sleep(500 * time.Millisecond)
+
+			if err := startWebViewApp(url); err != nil {
+				log.Printf("Failed to start WebView app: %v, falling back to browser", err)
+				openBrowser(url)
+			}
+		}()
+		return
+	}
+
+	// Fall back to system browser
+	log.Println("WebView not available, opening in system browser")
+	openBrowser(url)
+}
+
+// webviewAvailable checks if the WebView library is available
+func webviewAvailable() bool {
+	// Try running a simple command to check if WebView can be initialized
+	cmd := exec.Command("go", "run", "-c", `
+		package main
+		import "github.com/webview/webview"
+		func main() {
+			w := webview.New(false)
+			defer w.Destroy()
 		}
-	}()
+	`)
 
-	return server
+	return cmd.Run() == nil
 }
 
-// launchGUI creates and launches the desktop GUI using webview or lorca
-func launchGUI(ctx context.Context, useWebView bool) {
-	appURL := fmt.Sprintf("http://localhost:%d", appPort)
+// startWebViewApp starts the WebView-based desktop app
+func startWebViewApp(url string) error {
+	// This requires the webview package to be available
+	// Since we don't have it directly in our dependencies,
+	// we'll create a small app that uses it and run it
 
-	if useWebView {
-		// Use webview for cross-platform GUI
-		w := webview.New(true)
-		defer w.Destroy()
-		w.SetTitle("Cytube Chat Viewer")
-		w.SetSize(appWidth, appHeight, webview.HintNone)
-		w.Navigate(appURL)
-
-		// Run the webview window
-		w.Run()
-	} else {
-		// Use lorca (Chromium-based) if available
-		ui, err := lorca.New(appURL, "", appWidth, appHeight)
-		if err != nil {
-			log.Fatalf("Failed to create UI: %v", err)
-		}
-		defer ui.Close()
-
-		// Wait for the window to be closed
-		<-ui.Done()
+	// Create a temporary go file
+	tempDir, err := os.MkdirTemp("", "cylog-webview")
+	if err != nil {
+		return err
 	}
-}
+	defer os.RemoveAll(tempDir)
 
-// createStaticFiles creates the necessary static files for the web UI
-func createStaticFiles() error {
-	staticDir := filepath.Join(".", "static")
-	if err := os.MkdirAll(staticDir, 0755); err != nil {
+	webviewAppPath := filepath.Join(tempDir, "webview_app.go")
+	webviewAppContent := fmt.Sprintf(`
+package main
+
+import (
+	"github.com/webview/webview"
+)
+
+func main() {
+	w := webview.New(true)
+	defer w.Destroy()
+	w.SetTitle("%s")
+	w.SetSize(%d, %d, webview.HintNone)
+	w.Navigate("%s")
+	w.Run()
+}
+`, desktopAppTitle, appWidth, appHeight, url)
+
+	if err := os.WriteFile(webviewAppPath, []byte(webviewAppContent), 0644); err != nil {
 		return err
 	}
 
-	// Create index.html
-	indexHTML := `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cytube Chat Viewer</title>
-    <link rel="stylesheet" href="/static/styles.css">
-</head>
-<body>
-    <div class="app-container">
-        <header>
-            <h1>Cytube Chat Viewer</h1>
-            <div class="controls">
-                <button id="fontSizeIncrease">A+</button>
-                <button id="fontSizeDecrease">A-</button>
-                <button id="chatWidthIncrease">W+</button>
-                <button id="chatWidthDecrease">W-</button>
-            </div>
-        </header>
-        <main>
-            <div id="chatwrap">
-                <div id="messagebuffer"></div>
-            </div>
-        </main>
-    </div>
-    <script>
-        const wsUrl = "{{.WebSocketURL}}";
-    </script>
-    <script src="/static/app.js"></script>
-</body>
-</html>`
+	// Run the temporary WebView app
+	cmd := exec.Command("go", "run", webviewAppPath)
+	return cmd.Start()
+}
 
-	if err := os.WriteFile(filepath.Join(staticDir, "index.html"), []byte(indexHTML), 0644); err != nil {
-		return err
+// setupLogger configures the application logging to both file and console
+func setupLogger() (*log.Logger, error) {
+	// Create logs directory if it doesn't exist
+	if err := os.MkdirAll(logsDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create logs directory: %w", err)
 	}
 
-	// Create CSS file
-	cssContent := `body {
-    font-family: Arial, sans-serif;
-    margin: 0;
-    padding: 0;
-    background-color: #0f0f0f;
-    color: #fff;
-}
-
-.app-container {
-    display: flex;
-    flex-direction: column;
-    height: 100vh;
-}
-
-header {
-    background-color: #1a1a1a;
-    padding: 10px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-}
-
-h1 {
-    margin: 0;
-    font-size: 20px;
-}
-
-.controls button {
-    background-color: #333;
-    color: white;
-    border: none;
-    padding: 5px 10px;
-    margin-left: 5px;
-    cursor: pointer;
-}
-
-.controls button:hover {
-    background-color: #555;
-}
-
-main {
-    flex: 1;
-    overflow: hidden;
-    display: flex;
-    padding: 10px;
-}
-
-#chatwrap {
-    width: 27em;
-    height: 100%;
-    background-color: rgba(0, 0, 0, 0.5);
-    border: 2px solid rgba(235, 155, 125, 0.5);
-    overflow-y: auto;
-    padding: 0;
-}
-
-#messagebuffer {
-    padding: 10px;
-}
-
-.message {
-    margin-bottom: 10px;
-    word-wrap: break-word;
-}
-
-.timestamp {
-    color: #999;
-    font-size: 2.2em;
-    margin-right: 5px;
-}
-
-.username {
-    color: #66aaff;
-    font-size: 2.2em;
-    font-weight: bold;
-    margin-right: 5px;
-}
-
-.content {
-    font-size: 4.8em;
-}
-
-@media (max-width: 768px) {
-    #chatwrap {
-        width: 100%;
-    }
-}`
-
-	if err := os.WriteFile(filepath.Join(staticDir, "styles.css"), []byte(cssContent), 0644); err != nil {
-		return err
+	// Open app log file
+	appLogPath := filepath.Join(logsDir, "app.log")
+	appLogFile, err := os.OpenFile(appLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open app log file: %w", err)
 	}
 
-	// Create JavaScript file
-	jsContent := `document.addEventListener('DOMContentLoaded', () => {
-    const messagebuffer = document.getElementById('messagebuffer');
-    const chatwrap = document.getElementById('chatwrap');
-    
-    // Message cache for deduplication
-    const messageIds = new Set();
-    
-    // WebSocket connection
-    const socket = new WebSocket(wsUrl);
-    
-    socket.onopen = () => {
-        console.log('Connected to server');
-    };
-    
-    socket.onmessage = (event) => {
-        const message = JSON.parse(event.data);
-        addMessage(message);
-    };
-    
-    socket.onerror = (error) => {
-        console.error('WebSocket error:', error);
-    };
-    
-    socket.onclose = () => {
-        console.log('Disconnected from server');
-        // Attempt to reconnect after a delay
-        setTimeout(() => {
-            window.location.reload();
-        }, 5000);
-    };
-    
-    // Add a message to the chat
-    function addMessage(message) {
-        // Skip if we've already added this message
-        if (messageIds.has(message.id)) {
-            return;
-        }
-        
-        // Add to our tracking set
-        messageIds.add(message.id);
-        
-        const shouldScroll = isAtBottom();
-        
-        // If we have HTML content, use that directly
-        if (message.html) {
-            const tempDiv = document.createElement('div');
-            tempDiv.innerHTML = message.html;
-            tempDiv.classList.add('message');
-            
-            // Add a data attribute for tracking
-            tempDiv.setAttribute('data-message-id', message.id);
-            
-            messagebuffer.appendChild(tempDiv);
-        } else {
-            // Otherwise create structured message
-            const msgElement = document.createElement('div');
-            msgElement.classList.add('message');
-            msgElement.setAttribute('data-message-id', message.id);
-            
-            const timestamp = document.createElement('span');
-            timestamp.classList.add('timestamp');
-            timestamp.textContent = new Date(message.timestamp).toLocaleTimeString();
-            
-            const username = document.createElement('span');
-            username.classList.add('username');
-            username.textContent = message.username;
-            
-            const content = document.createElement('span');
-            content.classList.add('content');
-            content.textContent = message.content;
-            
-            msgElement.appendChild(timestamp);
-            msgElement.appendChild(username);
-            msgElement.appendChild(content);
-            
-            messagebuffer.appendChild(msgElement);
-        }
-        
-        // Limit the number of messages (keep last 100)
-        const messages = messagebuffer.querySelectorAll('.message');
-        if (messages.length > 100) {
-            messagebuffer.removeChild(messages[0]);
-        }
-        
-        // Scroll to bottom if we were already at the bottom
-        if (shouldScroll) {
-            scrollToBottom();
-        }
-    }
-    
-    // Check if user is at the bottom of the chat
-    function isAtBottom() {
-        return messagebuffer.scrollHeight - messagebuffer.scrollTop <= messagebuffer.clientHeight + 10;
-    }
-    
-    // Scroll to the bottom of the chat
-    function scrollToBottom() {
-        messagebuffer.scrollTop = messagebuffer.scrollHeight;
-    }
-    
-    // Font size adjustment
-    let fontSize = 16; // Base font size in pixels
-    
-    document.getElementById('fontSizeIncrease').addEventListener('click', () => {
-        fontSize += 1;
-        updateFontSize();
-    });
-    
-    document.getElementById('fontSizeDecrease').addEventListener('click', () => {
-        fontSize = Math.max(8, fontSize - 1);
-        updateFontSize();
-    });
-    
-    function updateFontSize() {
-        document.documentElement.style.setProperty('--base-font-size', fontSize + 'px');
-        document.querySelectorAll('#messagebuffer span:not(.timestamp):not(.username)').forEach(el => {
-            el.style.fontSize = (fontSize * 1.2) + 'px';
-        });
-        document.querySelectorAll('#messagebuffer span.timestamp, #messagebuffer span.username').forEach(el => {
-            el.style.fontSize = (fontSize * 0.8) + 'px';
-        });
-    }
-    
-    // Chat width adjustment
-    let chatWidth = 27; // Width in em
-    
-    document.getElementById('chatWidthIncrease').addEventListener('click', () => {
-        chatWidth += 1;
-        updateChatWidth();
-    });
-    
-    document.getElementById('chatWidthDecrease').addEventListener('click', () => {
-        chatWidth = Math.max(10, chatWidth - 1);
-        updateChatWidth();
-    });
-    
-    function updateChatWidth() {
-        chatwrap.style.width = chatWidth + 'em';
-    }
-    
-    // Keyboard shortcuts
-    document.addEventListener('keydown', (e) => {
-        // Ignore if focus is on an input element
-        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) {
-            return;
-        }
-        
-        if (e.key === '=' || e.key === '+') {
-            if (e.shiftKey) {
-                // Increase font size
-                fontSize += 1;
-                updateFontSize();
-            } else {
-                // Increase chat width
-                chatWidth += 1;
-                updateChatWidth();
-            }
-            e.preventDefault();
-        } else if (e.key === '-' || e.key === '_') {
-            if (e.shiftKey) {
-                // Decrease font size
-                fontSize = Math.max(8, fontSize - 1);
-                updateFontSize();
-            } else {
-                // Decrease chat width
-                chatWidth = Math.max(10, chatWidth - 1);
-                updateChatWidth();
-            }
-            e.preventDefault();
-        }
-    });
-    
-    // Fetch initial messages
-    fetch('/api/messages')
-        .then(response => response.json())
-        .then(messages => {
-            messages.forEach(message => addMessage(message));
-            scrollToBottom();
-        })
-        .catch(error => console.error('Error fetching messages:', error));
-});`
+	// Create a multi-writer to log to both file and console
+	multiWriter := io.MultiWriter(os.Stdout, appLogFile)
 
-	if err := os.WriteFile(filepath.Join(staticDir, "app.js"), []byte(jsContent), 0644); err != nil {
-		return err
-	}
+	// Create and configure the logger
+	logger := log.New(multiWriter, "", log.LstdFlags)
 
-	return nil
+	// Replace the standard logger
+	log.SetOutput(multiWriter)
+	log.SetFlags(log.LstdFlags)
+
+	return logger, nil
 }
 
 func main() {
+	// Setup application logging
+	appLogger, err := setupLogger()
+	if err != nil {
+		log.Fatalf("Failed to setup logger: %v", err)
+	}
+
+	appLogger.Println("Starting Cylog application")
+
 	// Create context that will be canceled on SIGINT or SIGTERM
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -636,34 +650,52 @@ func main() {
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-signals
+		appLogger.Println("Shutting down due to signal")
 		cancel()
 	}()
 
-	// Create static files for the web UI
-	if err := createStaticFiles(); err != nil {
-		log.Fatalf("Failed to create static files: %v", err)
+	// Initialize chat logger
+	chatLogger, err := NewLogger()
+	if err != nil {
+		appLogger.Fatalf("Failed to initialize chat logger: %v", err)
 	}
 
 	// Create and start the chat server
-	chatServer := NewChatServer()
+	chatServer := NewChatServer(chatLogger)
 	chatServer.Run(ctx)
 
-	// Setup and start HTTP server
-	httpServer := setupHTTPServer(ctx, chatServer)
+	// Setup Gin server
+	router := setupGinServer(ctx, chatServer)
 
-	// Launch the desktop GUI
-	useWebView := true // Set to false to use lorca (Chromium) instead
-	go launchGUI(ctx, useWebView)
+	// Create HTTP server
+	server := &http.Server{
+		Addr:    fmt.Sprintf(":%d", appPort),
+		Handler: router,
+	}
 
-	// Wait for context cancellation or application exit
+	// Start the HTTP server in a goroutine
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			appLogger.Fatalf("HTTP server error: %v", err)
+		}
+	}()
+
+	appLogger.Printf("Server started at http://localhost:%d", appPort)
+
+	// Launch the desktop application
+	appURL := fmt.Sprintf("http://localhost:%d", appPort)
+	launchDesktopApp(appURL)
+
+	// Wait for context cancellation
 	<-ctx.Done()
+	appLogger.Println("Shutting down server...")
 
 	// Gracefully shutdown the HTTP server
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
-	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		log.Printf("HTTP server shutdown error: %v", err)
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		appLogger.Printf("HTTP server shutdown error: %v", err)
 	}
 
-	log.Println("Application shutdown complete")
+	appLogger.Println("Application shutdown complete")
 }
